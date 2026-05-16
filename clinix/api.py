@@ -12,6 +12,7 @@ from .serializers import TratamientoSerializer, MedicamentoSerializer, PacienteT
 from .models import Medicamento, Tratamiento, PacienteTratamiento, TratamientoMedicamento, RegistroMedication, Paciente, Doctor
 from django.utils import timezone
 from datetime import timedelta
+from django.db.models import Q, Count
 from drf_spectacular.utils import inline_serializer
 from rest_framework import serializers
 #Integracion de los endpoints para el manejo de las citas 
@@ -43,23 +44,23 @@ class MedicamentoView(APIView):
     )
     def get(self, request, id=None): 
         try:
-            doctor = Doctor.objects.get(user=request.user)
-        except Doctor.DoesNotExist:
+            # Obtenemos el doctor logueado
+            doctor = request.user.doctor
+        except Exception:
             return Response({
-                'error': 'El usuario no tiene un perfil de doctor asociado',
+                'message': 'El usuario no tiene un perfil de doctor asociado',
                 'status': 403
             }, status=status.HTTP_403_FORBIDDEN)
 
         # Si envían un ID, retornamos un solo elemento
         if id is not None:
-            try:
-                doctor = request.user.doctor;
-                med = Medicamento.objects.get(id=id, doctor = doctor, is_active=True);
+            try:                
+
                 data = {
                     'id': med.id, 
                     'nombre_medicamento': med.nombre_medicamento, 
                     'descripcion': med.descripcion, 
-                    'imagen': med.imagen.url if med.imagen else None,
+                    'imagen': med.imagen,
                 }
                 return Response({
                     'medicamento': data, 
@@ -68,12 +69,12 @@ class MedicamentoView(APIView):
                 }, status=status.HTTP_200_OK)
             except Medicamento.DoesNotExist:
                 return Response({
-                    'error': 'El medicamento no existe o no tienes permiso para verlo',
+                    'error': 'El medicamento no existe o no le pertenece',
                     'status': 404
                 }, status=status.HTTP_404_NOT_FOUND)
 
-        # Si NO envían un ID, listamos solo los del doctor logueado
-        medicamentos = Medicamento.objects.filter(doctor=doctor)
+        # Si NO envían un ID, listamos solo los del doctor y activos
+        medicamentos = Medicamento.objects.filter(doctor=doctor, is_active=True)
         data = []
 
         for med in medicamentos: 
@@ -82,7 +83,7 @@ class MedicamentoView(APIView):
                 'doctor': med.doctor.id, 
                 'nombre_medicamento': med.nombre_medicamento, 
                 'descripcion': med.descripcion, 
-                'imagen': med.imagen.url if med.imagen else None,
+                'imagen': med.imagen,
             })
 
         return Response({
@@ -115,16 +116,17 @@ class MedicamentoView(APIView):
     )
     def post(self, request): 
 
-        data = request.data;
+        # IMPORTANTE: Copiamos el request.data para que sea mutable (necesario en form-data)
+        data = request.data.copy() if hasattr(request.data, 'copy') else request.data
         
         try:
             with transaction.atomic(): 
 
                 # Solo el doctor es el dueño de sus medicamentos 
-                doctor = request.user.doctor;
-                data['doctor'] = doctor.id;
+                doctor = request.user.doctor
+                data['doctor'] = doctor.id
                 
-                serializer = MedicamentoSerializer(data=data);
+                serializer = MedicamentoSerializer(data=data)
 
                 if serializer.is_valid(): 
                     serializer.save()
@@ -133,21 +135,21 @@ class MedicamentoView(APIView):
                         "data" : serializer.data, 
                         "message" : "Medicamento creado exitosamente",
                         "status" : 201,
-                    }, status=status.HTTP_201_CREATED);
+                    }, status=status.HTTP_201_CREATED)
 
                 else: 
                     return Response({
                         "error" : serializer.errors, 
                         "message" : "Error al crear el medicamento",
                         "status" : 400,
-                    }, status=status.HTTP_400_BAD_REQUEST);
+                    }, status=status.HTTP_400_BAD_REQUEST)
 
         except Exception as e: 
             return Response({
                 'message': 'Error al crear el medicamento', 
                 'error': str(e),
                 'status': 500,
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR); 
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
     @extend_schema(
         summary="Actualizar un medicamento por ID",
@@ -173,28 +175,41 @@ class MedicamentoView(APIView):
     )
     def put(self, request, id): 
 
-        data = request.data; 
-
+        data = request.data
+        
         try: 
+            doctor = request.user.doctor
             with transaction.atomic(): 
 
-                medicamento = Medicamento.objects.get(id=id); 
-                medicamento.nombre_medicamento = data['nombre_medicamento']; 
-                medicamento.descripcion = data['descripcion']; 
-                medicamento.imagen = data['imagen']; 
-                medicamento.save(); 
+                # Verificamos que el medicamento pertenezca al doctor
+                medicamento = Medicamento.objects.get(id=id, doctor=doctor) 
+                
+                medicamento.nombre_medicamento = data.get('nombre_medicamento', medicamento.nombre_medicamento) 
+                medicamento.descripcion = data.get('descripcion', medicamento.descripcion) 
+                
+                # SOLO actualizamos si es un archivo, no si es un string (URL)
+                nueva_imagen = data.get('imagen')
+                if nueva_imagen and not isinstance(nueva_imagen, str):
+                    medicamento.imagen = nueva_imagen
+                
+                medicamento.save() 
 
                 return Response({ 
                     'message': 'Medicamento actualizado exitosamente', 
                     'status': 200,
-                }, status=status.HTTP_200_OK); 
+                }, status=status.HTTP_200_OK) 
 
+        except Medicamento.DoesNotExist:
+            return Response({
+                'message': 'El medicamento no existe o no le pertenece',
+                'status': 404
+            }, status=status.HTTP_404_NOT_FOUND)
         except Exception as e: 
             return Response({ 
                 'message': 'Error al actualizar el medicamento', 
                 'error': str(e), 
                 'status': 500,
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR); 
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     #eliminado logico, no se eliminara el medicamento
     @extend_schema(
@@ -211,16 +226,22 @@ class MedicamentoView(APIView):
     def delete(self, request, id): 
 
         try: 
+            doctor = request.user.doctor
             with transaction.atomic(): 
-
-                medicamento = Medicamento.objects.get(id=id); 
-                medicamento.is_active = False; 
-                medicamento.save(); 
+                medicamento = Medicamento.objects.get(id=id, doctor=doctor) 
+                medicamento.is_active = False 
+                medicamento.save() 
 
                 return Response({ 
                     'message': 'Medicamento eliminado exitosamente', 
                     'status': 200,
-                }, status=status.HTTP_200_OK); 
+                }, status=status.HTTP_200_OK) 
+
+        except Medicamento.DoesNotExist:
+            return Response({
+                'message': 'El medicamento no existe o no le pertenece',
+                'status': 404
+            }, status=status.HTTP_404_NOT_FOUND)
 
         except Exception as e: 
             return Response({ 
@@ -247,11 +268,17 @@ class TratamientoView(APIView) :
         }
     )
     def get(self, request, id=None): 
+        try:
+            doctor = request.user.doctor
+        except Exception:
+            return Response({
+                'message': 'El usuario no tiene un perfil de doctor asociado',
+                'status': 403
+            }, status=status.HTTP_403_FORBIDDEN)
+
         if id is not None: 
             try: 
-                doctor = request.user.doctor;
                 tratamiento = Tratamiento.objects.get(uuid=id, doctor=doctor, is_active=True) 
-                
                 serializer = TratamientoSerializer(tratamiento)
 
                 return Response({ 
@@ -262,15 +289,13 @@ class TratamientoView(APIView) :
 
             except Tratamiento.DoesNotExist: 
                 return Response({ 
-                    'message': 'El tratamiento no existe', 
+                    'message': 'El tratamiento no existe o no le pertenece', 
                     'status': 404,
                 }, status=status.HTTP_404_NOT_FOUND) 
 
-        # Si no envían ID, traemos todos los tratamientos
+        # Si no envían ID, traemos solo los del doctor y activos
         else: 
-            tratamientos = Tratamiento.objects.all()
-            
-            # many=True le dice al serializador que es una lista de objetos
+            tratamientos = Tratamiento.objects.filter(doctor=doctor, is_active=True)
             serializer = TratamientoSerializer(tratamientos, many=True)
 
             return Response({ 
@@ -301,30 +326,36 @@ class TratamientoView(APIView) :
     )
     def post(self, request): 
 
-        #validar con el serializador 
+        # IMPORTANTE: Copiamos para asegurar mutabilidad
+        data = request.data.copy() if hasattr(request.data, 'copy') else request.data
 
-        data = request.data; 
+        try:
+            # Solo el doctor es el dueño de sus tratamientos 
+            doctor = request.user.doctor 
+            data['doctor'] = doctor.id 
 
-        # Solo el doctor es el dueño de sus tratamientos 
-        doctor = request.user.doctor; 
-        data['doctor'] = doctor.id; 
+            serializer = TratamientoSerializer(data=data)
 
-        serializer = TratamientoSerializer(data=data); 
+            if serializer.is_valid(): 
+                serializer.save()
 
-        if serializer.is_valid(): 
-            serializer.save()
-
-            return Response({ 
-                'data': serializer.data, 
-                'message': 'Tratamiento creado exitosamente', 
-                'status': 201, 
-            }, status=status.HTTP_201_CREATED); 
-        else: 
-            return Response({ 
-                'error': serializer.errors, 
-                'message': 'Error al crear el tratamiento', 
-                'status': 400, 
-            }, status=status.HTTP_400_BAD_REQUEST); 
+                return Response({ 
+                    'data': serializer.data, 
+                    'message': 'Tratamiento creado exitosamente', 
+                    'status': 201, 
+                }, status=status.HTTP_201_CREATED) 
+            else: 
+                return Response({ 
+                    'error': serializer.errors, 
+                    'message': 'Error al crear el tratamiento', 
+                    'status': 400, 
+                }, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({
+                'message': 'Error al crear el tratamiento',
+                'error': str(e),
+                'status': 500,
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @extend_schema(
         summary="Actualizar un tratamiento por UUID",
@@ -352,32 +383,40 @@ class TratamientoView(APIView) :
     def put(self, request, id): 
 
         try: 
+            doctor = request.user.doctor
+            tratamiento = Tratamiento.objects.get(uuid=id, doctor=doctor) 
+            
+            # Aseguramos que el doctor no se cambie a uno que no es el logueado
+            data = request.data.copy() if hasattr(request.data, 'copy') else request.data
+            data['doctor'] = doctor.id
 
-            tratamiento = Tratamiento.objects.get(uuid=id); 
-            serializer = TratamientoSerializer(tratamiento, data=request.data);
+            serializer = TratamientoSerializer(tratamiento, data=data)
 
             if serializer.is_valid(): 
-
-                serializer.save();
-
+                serializer.save()
                 return Response({ 
                     'message': 'Tratamiento actualizado exitosamente', 
                     'status': 200, 
-                }, status=status.HTTP_200_OK); 
+                }, status=status.HTTP_200_OK) 
             
             else: 
                 return Response({ 
                     'error': serializer.errors, 
                     'message': 'Error al actualizar el tratamiento', 
                     'status': 400, 
-                }, status=status.HTTP_400_BAD_REQUEST); 
+                }, status=status.HTTP_400_BAD_REQUEST) 
 
+        except Tratamiento.DoesNotExist:
+            return Response({
+                'message': 'El tratamiento no existe o no le pertenece',
+                'status': 404
+            }, status=status.HTTP_404_NOT_FOUND)
         except Exception as e: 
             return Response({ 
                 'message': 'Error al actualizar el tratamiento', 
                 'error': str(e), 
                 'status': 500, 
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR); 
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @extend_schema(
         summary="Eliminar un tratamiento (borrado lógico)",
@@ -394,15 +433,21 @@ class TratamientoView(APIView) :
 
         try: 
             with transaction.atomic(): 
-
-                tratamiento = Tratamiento.objects.get(uuid=id); 
-                tratamiento.is_active = False; 
-                tratamiento.save(); 
+                doctor = request.user.doctor
+                tratamiento = Tratamiento.objects.get(uuid=id, doctor=doctor) 
+                tratamiento.is_active = False 
+                tratamiento.save() 
 
                 return Response({ 
                     'message': 'Tratamiento eliminado exitosamente', 
                     'status': 200,
-                }, status=status.HTTP_200_OK); 
+                }, status=status.HTTP_200_OK) 
+
+        except Tratamiento.DoesNotExist:
+            return Response({
+                'message': 'El tratamiento no existe o no le pertenece',
+                'status': 404
+            }, status=status.HTTP_404_NOT_FOUND)
 
         except Exception as e: 
             return Response({ 
