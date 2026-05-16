@@ -867,7 +867,6 @@ class DashboardPacienteView(APIView):
         try:
             paciente = Paciente.objects.select_related('user').get(id=id)
             
-            # Validación de seguridad: solo el propio paciente o un admin
             if not request.user.is_staff and paciente.user != request.user:
                 return Response({
                     "message": "No tiene permisos para acceder a los datos de este paciente",
@@ -875,44 +874,56 @@ class DashboardPacienteView(APIView):
                 }, status=status.HTTP_403_FORBIDDEN)
             
             hoy = timezone.now().date()
+            ahora = timezone.now().time()
 
-            # 1. Tratamientos activos
-            tratamientos_activos = PacienteTratamiento.objects.filter(
+            active_pts = PacienteTratamiento.objects.filter(
                 paciente=paciente,
                 is_active=True
-            ).count()
+            )
+            tratamientos_activos = active_pts.count()
+            treatment_ids = [pt.tratamiento_id for pt in active_pts]
+            start_dates = {pt.tratamiento_id: pt.fecha_inicio if pt.fecha_inicio else pt.created_at.date()
+                          for pt in active_pts}
 
-            # 2. Medicamentos de hoy (limitado a tratamientos activos)
-            active_treatment_ids = PacienteTratamiento.objects.filter(
-                paciente=paciente,
+            scheduled_meds = list(TratamientoMedicamento.objects.filter(
+                tratamiento__in=treatment_ids,
                 is_active=True
-            ).values_list('tratamiento_id', flat=True)
+            ).select_related('medicamento'))
 
-            registros_hoy = RegistroMedication.objects.filter(
+            records_hoy = RegistroMedication.objects.filter(
                 paciente=paciente,
                 fecha_toma=hoy,
-                tratamiento_medicamento__tratamiento__in=active_treatment_ids
+                tratamiento_medicamento__in=scheduled_meds
             )
-            
-            medicamentos_hoy = registros_hoy.count()
-            medicamentos_tomados_hoy = registros_hoy.filter(estado='2').count()
+            records_hoy_by_tm = {r.tratamiento_medicamento_id: r for r in records_hoy}
 
-            # 3. Porcentaje de adherencia
+            medicamentos_hoy = 0
+            medicamentos_tomados_hoy = 0
+            proxima_dosis = None
+
+            for tm in scheduled_meds:
+                if tm.duracion_dias is not None:
+                    start_dt = start_dates.get(tm.tratamiento_id, hoy)
+                    end_dt = start_dt + timedelta(days=tm.duracion_dias)
+                    if end_dt <= hoy:
+                        continue
+
+                medicamentos_hoy += 1
+                record = records_hoy_by_tm.get(tm.id)
+
+                if record and str(record.estado) == '2':
+                    medicamentos_tomados_hoy += 1
+                elif not proxima_dosis:
+                    from datetime import time as dt_time
+                    hora_med = self._parse_horario_time(tm.horario)
+                    if hora_med > ahora or (record and str(record.estado) != '2'):
+                        proxima_dosis = {
+                            "medicamento": tm.medicamento.nombre_medicamento,
+                            "hora": tm.horario
+                        }
+
             porcentaje_adherencia = int((medicamentos_tomados_hoy / medicamentos_hoy) * 100) if medicamentos_hoy > 0 else 0
 
-            # 4. Próxima dosis (solo pendientes o atrasados)
-            proxima_dosis_registro = registros_hoy.filter(
-                estado__in=['1', '3']
-            ).select_related('tratamiento_medicamento__medicamento').order_by('hora').first()
-
-            proxima_dosis = None
-            if proxima_dosis_registro:
-                proxima_dosis = {
-                    "medicamento": proxima_dosis_registro.tratamiento_medicamento.medicamento.nombre_medicamento,
-                    "hora": proxima_dosis_registro.hora.strftime("%H:%M")
-                }
-
-            # 5. Nombre
             nombre = paciente.user.email.split('@')[0].capitalize() if paciente.user.email else "Paciente"
 
             return Response({
@@ -929,17 +940,14 @@ class DashboardPacienteView(APIView):
         except Exception as e:
             return Response({"message": "Error interno del servidor", "error": str(e), "status": 500}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        except Paciente.DoesNotExist:
-            return Response({
-                "message": "Paciente no encontrado",
-                "status": 404
-            }, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            return Response({
-                "message": "Error al obtener el dashboard del paciente",
-                "error": str(e),
-                "status": 500
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    def _parse_horario_time(self, horario):
+        import re
+        match = re.search(r'(\d{1,2}):(\d{2})', horario)
+        if match:
+            from datetime import time
+            return time(int(match.group(1)), int(match.group(2)))
+        from datetime import time
+        return time(8, 0)
 
 @extend_schema(tags=['Obtener tratamientos activos del paciente'])
 class TratamientosActivosPacienteView(APIView): 
@@ -963,7 +971,9 @@ class TratamientosActivosPacienteView(APIView):
                     'titulo': serializers.CharField(),
                     'descripcion': serializers.CharField(),
                     'medicamentos': serializers.IntegerField(),
-                    'doctor': serializers.CharField()
+                    'doctor': serializers.CharField(),
+                    'endDate': serializers.CharField(help_text="Fecha fin calculada del tratamiento"),
+                    'schedules': serializers.ListField(child=serializers.CharField(), help_text="Horarios agrupados"),
                 }
             ),
             403: OpenApiResponse(description="No tiene permisos para ver este paciente"),
@@ -975,13 +985,14 @@ class TratamientosActivosPacienteView(APIView):
         try:
             paciente = Paciente.objects.select_related('user').get(id=id)
             
-            # Seguridad: IDOR check
             if not request.user.is_staff and paciente.user != request.user:
                 return Response({
                     "message": "No tiene permisos para acceder a los datos de este paciente",
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
             
+            hoy = timezone.now().date()
+
             tratamientos_activos = PacienteTratamiento.objects.filter(
                 paciente=paciente,
                 is_active=True
@@ -992,15 +1003,30 @@ class TratamientosActivosPacienteView(APIView):
                 tratamiento = pt.tratamiento
                 doctor = tratamiento.doctor
                 
-                cantidad_medicamentos = tratamiento.tratamientomedicamento_set.count()
+                meds = tratamiento.tratamientomedicamento_set.filter(is_active=True)
+                cantidad_medicamentos = meds.count()
                 doctor_nombre = doctor.user.email.split('@')[0].capitalize() if doctor.user.email else "Doctor"
+
+                schedules = []
+                max_end_date = None
+                start_date = pt.fecha_inicio if pt.fecha_inicio else pt.created_at.date()
+
+                for tm in meds:
+                    if tm.horario and tm.horario not in schedules:
+                        schedules.append(tm.horario)
+                    if tm.duracion_dias:
+                        item_end = start_date + timedelta(days=tm.duracion_dias)
+                        if max_end_date is None or item_end > max_end_date:
+                            max_end_date = item_end
 
                 data.append({
                     "tratamiento_id": str(tratamiento.uuid),
                     "titulo": tratamiento.titulo,
                     "descripcion": tratamiento.descripcion,
                     "medicamentos": cantidad_medicamentos,
-                    "doctor": f"Dr. {doctor_nombre}"
+                    "doctor": f"Dr. {doctor_nombre}",
+                    "endDate": max_end_date.strftime("%Y-%m-%d") if max_end_date else None,
+                    "schedules": sorted(schedules),
                 })
 
             return Response(data, status=status.HTTP_200_OK)
@@ -1152,12 +1178,16 @@ class HistorialMedicacionView(APIView):
 
                 data.append({
                     "medicationName": tm.medicamento.nombre_medicamento,
-                    "completedAt": f"{registro.fecha_toma} {registro.hora}",
+                    "completedAt": f"{registro.fecha_toma}T{hora.strftime('%H:%M:%S')}",
                     "period": period,
                     "completed": completed,
-                "message": "Paciente no encontrado",
-                "status": 404
-            }, status=status.HTTP_404_NOT_FOUND)
+                    "scheduledTime": tm.horario,
+                })
+
+            return Response(data, status=status.HTTP_200_OK)
+
+        except Paciente.DoesNotExist:
+            return Response({"message": "Paciente no encontrado", "status": 404}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({
                 "message": "Error al obtener el historial",
@@ -1717,6 +1747,7 @@ class TodayMedicationsView(APIView):
                                 'completed': serializers.BooleanField(help_text="Si el medicamento fue tomado"),
                                 'doctorName': serializers.CharField(help_text="Nombre del doctor"),
                                 'treatmentName': serializers.CharField(help_text="Nombre del tratamiento"),
+                                'treatmentMedicationId': serializers.IntegerField(help_text="ID del TratamientoMedicamento"),
                             }
                         )
                     ),
@@ -1731,7 +1762,6 @@ class TodayMedicationsView(APIView):
         try:
             paciente = Paciente.objects.select_related('user').get(id=patientId)
 
-            # Validación de seguridad: solo el propio paciente o un admin
             if not request.user.is_staff and paciente.user != request.user:
                 return Response({
                     "message": "No tiene permisos para ver los datos de este paciente",
@@ -1740,20 +1770,28 @@ class TodayMedicationsView(APIView):
 
             hoy = timezone.now().date()
 
-            # Obtener tratamientos activos
-            active_treatments = PacienteTratamiento.objects.filter(
+            active_pts = PacienteTratamiento.objects.filter(
                 paciente=paciente,
                 is_active=True
-            ).values_list('tratamiento_id', flat=True)
+            )
+            treatment_ids = [pt.tratamiento_id for pt in active_pts]
+            start_dates = {pt.tratamiento_id: pt.fecha_inicio if pt.fecha_inicio else pt.created_at.date()
+                          for pt in active_pts}
+
+            scheduled_meds = list(TratamientoMedicamento.objects.filter(
+                tratamiento__in=treatment_ids,
+                is_active=True
+            ).select_related('medicamento', 'tratamiento__doctor__user'))
 
             registros = RegistroMedication.objects.filter(
                 paciente=paciente,
                 fecha_toma=hoy,
-                tratamiento_medicamento__tratamiento__in=active_treatments
-            ).select_related(
-                'tratamiento_medicamento__medicamento',
-                'tratamiento_medicamento__tratamiento__doctor__user'
-            ).order_by('hora')
+                tratamiento_medicamento__in=scheduled_meds
+            )
+
+            record_by_tm = {
+                r.tratamiento_medicamento_id: r for r in registros
+            }
 
             grupos = {
                 "Mañana": [],
@@ -1761,30 +1799,44 @@ class TodayMedicationsView(APIView):
                 "Noche": []
             }
 
-            for registro in registros:
-                tm = registro.tratamiento_medicamento
+            for tm in scheduled_meds:
+                if tm.duracion_dias is not None:
+                    start_dt = start_dates.get(tm.tratamiento_id, hoy)
+                    end_dt = start_dt + timedelta(days=tm.duracion_dias)
+                    if end_dt <= hoy:
+                        continue
+
                 tratamiento = tm.tratamiento
-
-                hora_str = registro.hora.strftime("%I:%M %p")
-
                 doctor = tratamiento.doctor
                 doctor_name = doctor.user.email.split('@')[0].capitalize() if doctor.user.email else "Doctor"
 
+                record = record_by_tm.get(tm.id)
+
+                if record:
+                    item_id = str(record.id)
+                    hora_str = record.hora.strftime("%I:%M %p")
+                    hora_periodo = record.hora.hour
+                    completed = str(record.estado) == '2'
+                else:
+                    item_id = f"sched_{tm.id}"
+                    hora_str = tm.horario
+                    hora_periodo = self._parse_horario_hour(tm.horario)
+                    completed = False
+
                 item = {
-                    "id": str(registro.id),
+                    "id": item_id,
                     "title": tm.medicamento.nombre_medicamento,
                     "dose": tm.dosis,
                     "time": hora_str,
-                    "completed": str(registro.estado) == '2',
+                    "completed": completed,
                     "doctorName": doctor_name,
-                    "treatmentName": tratamiento.titulo
+                    "treatmentName": tratamiento.titulo,
+                    "treatmentMedicationId": tm.id,
                 }
 
-                # Asignar al grupo según la hora
-                hora = registro.hora.hour
-                if 0 <= hora < 12:
+                if 0 <= hora_periodo < 12:
                     grupos["Mañana"].append(item)
-                elif 12 <= hora < 18:
+                elif 12 <= hora_periodo < 18:
                     grupos["Tarde"].append(item)
                 else:
                     grupos["Noche"].append(item)
@@ -1817,6 +1869,13 @@ class TodayMedicationsView(APIView):
                 "error": str(e),
                 "status": 500
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _parse_horario_hour(self, horario):
+        import re
+        match = re.search(r'(\d{1,2}):(\d{2})', horario)
+        if match:
+            return int(match.group(1))
+        return 8
 
 @extend_schema(tags=['Métricas de Hoy'])
 class TodayMetricsView(APIView):
@@ -1877,37 +1936,46 @@ class TodayMetricsView(APIView):
             active_treatments = PacienteTratamiento.objects.filter(
                 paciente=paciente,
                 is_active=True
-            ).values_list('tratamiento_id', flat=True)
+            )
+            treatment_ids = [pt.tratamiento_id for pt in active_treatments]
+            start_dates = {pt.tratamiento_id: pt.fecha_inicio if pt.fecha_inicio else pt.created_at.date()
+                          for pt in active_treatments}
 
-            # Convertir a lista para evitar query extra en .count() al final
-            registros_hoy = list(RegistroMedication.objects.filter(
+            scheduled_meds = list(TratamientoMedicamento.objects.filter(
+                tratamiento__in=treatment_ids,
+                is_active=True
+            ).select_related('medicamento'))
+
+            records_hoy = RegistroMedication.objects.filter(
                 paciente=paciente,
                 fecha_toma=fecha_actual,
-                tratamiento_medicamento__tratamiento__in=active_treatments
-            ))
+                tratamiento_medicamento__in=scheduled_meds
+            )
+            records_hoy_by_tm = {r.tratamiento_medicamento_id: r for r in records_hoy}
 
-            total = len(registros_hoy)
             completed = 0
             pending = 0
             overdue = 0
 
-            registros_para_actualizar = []
+            for tm in scheduled_meds:
+                if tm.duracion_dias is not None:
+                    start_dt = start_dates.get(tm.tratamiento_id, fecha_actual)
+                    end_date = start_dt + timedelta(days=tm.duracion_dias)
+                    if end_date <= fecha_actual:
+                        continue
 
-            for registro in registros_hoy:
-                if str(registro.estado) == '2':
+                record = records_hoy_by_tm.get(tm.id)
+
+                if record and str(record.estado) == '2':
                     completed += 1
                 else:
-                    if registro.hora < hora_actual:
+                    hora_med = self._parse_horario_time(tm.horario)
+                    if hora_med < hora_actual:
                         overdue += 1
-                        if str(registro.estado) == '1':
-                            registro.estado = '3'
-                            registros_para_actualizar.append(registro)
                     else:
                         pending += 1
 
-            # Actualizar en batch los registros atrasados
-            if registros_para_actualizar:
-                RegistroMedication.objects.bulk_update(registros_para_actualizar, ['estado'])
+            total = completed + pending + overdue
 
             data = {
                 "completed": completed,
@@ -1929,6 +1997,15 @@ class TodayMetricsView(APIView):
                 "error": str(e),
                 "status": 500
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _parse_horario_time(self, horario):
+        import re
+        match = re.search(r'(\d{1,2}):(\d{2})', horario)
+        if match:
+            from datetime import time
+            return time(int(match.group(1)), int(match.group(2)))
+        from datetime import time
+        return time(8, 0)
 
 @extend_schema(tags=['Cumplimiento Semanal'])
 class WeeklyAdherenceView(APIView):
@@ -1974,7 +2051,6 @@ class WeeklyAdherenceView(APIView):
         try:
             paciente = Paciente.objects.select_related('user').get(id=patientId)
 
-            # Validación de seguridad
             if not request.user.is_staff and paciente.user != request.user:
                 return Response({
                     "message": "No tiene permisos para ver los datos de este paciente",
@@ -1983,21 +2059,27 @@ class WeeklyAdherenceView(APIView):
 
             hoy = timezone.now().date()
 
-            # Lunes de esta semana (0 = Lunes, 6 = Domingo)
             start_of_week = hoy - timedelta(days=hoy.weekday())
 
             active_treatments = PacienteTratamiento.objects.filter(
                 paciente=paciente,
                 is_active=True
-            ).values_list('tratamiento_id', flat=True)
+            )
+            treatment_ids = [pt.tratamiento_id for pt in active_treatments]
+            start_dates = {pt.tratamiento_id: pt.fecha_inicio if pt.fecha_inicio else pt.created_at.date()
+                          for pt in active_treatments}
 
-            # Convertir a lista para evitar múltiples queries al iterar por día
-            registros_semana = list(RegistroMedication.objects.filter(
+            scheduled_meds = list(TratamientoMedicamento.objects.filter(
+                tratamiento__in=treatment_ids,
+                is_active=True
+            ))
+
+            records = RegistroMedication.objects.filter(
                 paciente=paciente,
                 fecha_toma__gte=start_of_week,
                 fecha_toma__lt=start_of_week + timedelta(days=7),
-                tratamiento_medicamento__tratamiento__in=active_treatments
-            ))
+                tratamiento_medicamento__in=scheduled_meds
+            )
 
             DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
             resultado = []
@@ -2011,11 +2093,24 @@ class WeeklyAdherenceView(APIView):
                 elif current_date > hoy:
                     done_status = False
                 else:
-                    registros_dia = [r for r in registros_semana if r.fecha_toma == current_date]
-                    if len(registros_dia) == 0:
+                    meds_for_day = []
+                    for m in scheduled_meds:
+                        if m.duracion_dias is not None:
+                            start_dt = start_dates.get(m.tratamiento_id, current_date)
+                            end_dt = start_dt + timedelta(days=m.duracion_dias)
+                            if current_date < start_dt or current_date >= end_dt:
+                                continue
+                        meds_for_day.append(m)
+
+                    if len(meds_for_day) == 0:
                         done_status = False
                     else:
-                        done_status = all(str(r.estado) == '2' for r in registros_dia)
+                        records_for_day = {r.tratamiento_medicamento_id: r
+                                          for r in records if r.fecha_toma == current_date}
+                        done_status = all(
+                            records_for_day.get(m.id) and str(records_for_day[m.id].estado) == '2'
+                            for m in meds_for_day
+                        )
 
                 resultado.append({
                     "day": day_name,
@@ -2078,27 +2173,45 @@ class GlobalProgressView(APIView):
         try:
             paciente = Paciente.objects.select_related('user').get(id=patientId)
 
-            # Validación de seguridad
             if not request.user.is_staff and paciente.user != request.user:
                 return Response({
                     "message": "No tiene permisos para ver los datos de este paciente",
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
 
-            # Obtener solo tratamientos activos
-            active_treatments = PacienteTratamiento.objects.filter(
+            hoy = timezone.now().date()
+
+            active_pts = PacienteTratamiento.objects.filter(
                 paciente=paciente,
                 is_active=True
-            ).values_list('tratamiento_id', flat=True)
+            ).select_related('tratamiento')
 
-            # Filtrar registros que pertenezcan a tratamientos activos
-            registros = RegistroMedication.objects.filter(
+            if not active_pts.exists():
+                return Response({"progress": 0, "completed": 0, "total": 0}, status=status.HTTP_200_OK)
+
+            treatment_ids = [pt.tratamiento_id for pt in active_pts]
+            treatment_start = {pt.tratamiento_id: pt.fecha_inicio if pt.fecha_inicio else pt.created_at.date()
+                              for pt in active_pts}
+
+            scheduled_meds = list(TratamientoMedicamento.objects.filter(
+                tratamiento__in=treatment_ids,
+                is_active=True
+            ))
+
+            completed = RegistroMedication.objects.filter(
                 paciente=paciente,
-                tratamiento_medicamento__tratamiento__in=active_treatments
-            )
+                estado='2',
+                tratamiento_medicamento__in=scheduled_meds
+            ).count()
 
-            total = registros.count()
-            completed = registros.filter(estado='2').count()
+            total = 0
+            for tm in scheduled_meds:
+                start_date = treatment_start.get(tm.tratamiento_id, hoy)
+                end_date = start_date + timedelta(days=tm.duracion_dias) if tm.duracion_dias else hoy
+                days = (end_date - start_date).days + 1
+                if days > 0:
+                    total += days
+
             progress = int((completed / total) * 100) if total > 0 else 0
 
             data = {

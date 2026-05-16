@@ -47,6 +47,7 @@ class PacienteTratamiento(models.Model):
     paciente = models.ForeignKey(Paciente, on_delete=models.CASCADE)
     tratamiento = models.ForeignKey(Tratamiento, on_delete=models.CASCADE)
     is_active = models.BooleanField(default=True)
+    fecha_inicio = models.DateField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True) 
     updated_at = models.DateTimeField(auto_now=True) 
 
@@ -58,6 +59,7 @@ class TratamientoMedicamento(models.Model):
     horario = models.CharField(max_length=20)
     is_active = models.BooleanField(default=True)
     instrucciones = models.TextField()
+    duracion_dias = models.PositiveIntegerField(null=True, blank=True)
 
     def __str__(self): 
         return self.medicamento.nombre_medicamento
