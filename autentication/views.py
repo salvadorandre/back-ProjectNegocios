@@ -301,6 +301,39 @@ class MockLoginView(APIView):
 
             refresh = RefreshToken.for_user(user)
             serializer = UsuarioSerializer(user)
+
+            try:
+                doctor = Doctor.objects.get(user=user)
+            except Doctor.DoesNotExist:
+                doctor = None
+
+            try:
+                paciente = Paciente.objects.get(user=user)
+            except Paciente.DoesNotExist:
+                paciente = None
+
+            if doctor:
+                return Response({
+                    'user': serializer.data,
+                    'doctor_id': {
+                        'id': doctor.id,
+                        'especialidad': doctor.especialidad,
+                        'colegiado': doctor.colegiado,
+                    },
+                    'refresh': str(refresh),
+                    'access': str(refresh.access_token),
+                }, status=status.HTTP_200_OK)
+
+            if paciente:
+                return Response({
+                    'user': serializer.data,
+                    'paciente_id': {
+                        'id': paciente.id,
+                    },
+                    'refresh': str(refresh),
+                    'access': str(refresh.access_token),
+                }, status=status.HTTP_200_OK)
+
             return Response({
                 'message': 'Mock login exitoso',
                 'user': serializer.data,
@@ -316,6 +349,7 @@ class MockLoginView(APIView):
 
 @extend_schema(tags=['Autenticación - Sesión'])
 class TokenRefreshView(APIView):
+    authentication_classes = []
     permission_classes = [AllowAny]
 
     @extend_schema(
