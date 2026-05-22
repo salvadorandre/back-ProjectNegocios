@@ -11,7 +11,7 @@ from drf_spectacular.types import OpenApiTypes
 from .serializers import TratamientoSerializer, MedicamentoSerializer, PacienteTratamientoSerializer, TratamientoMedicamentoSerializer
 from .models import Medicamento, Tratamiento, PacienteTratamiento, TratamientoMedicamento, RegistroMedication, Paciente, Doctor
 from django.utils import timezone
-from datetime import timedelta
+from datetime import timedelta, datetime
 from django.db.models import Q, Count
 from drf_spectacular.utils import inline_serializer
 from rest_framework import serializers
@@ -918,8 +918,8 @@ class DashboardPacienteView(APIView):
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
             
-            hoy = timezone.now().date()
-            ahora = timezone.now().time()
+            hoy = timezone.localtime(timezone.now()).date()
+            ahora = timezone.localtime(timezone.now()).time()
 
             active_pts = PacienteTratamiento.objects.filter(
                 paciente=paciente,
@@ -1036,7 +1036,7 @@ class TratamientosActivosPacienteView(APIView):
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
             
-            hoy = timezone.now().date()
+            hoy = timezone.localtime(timezone.now()).date()
 
             tratamientos_activos = PacienteTratamiento.objects.filter(
                 paciente=paciente,
@@ -1164,15 +1164,13 @@ class TratamientosPacienteView(APIView):
 class HistorialMedicacionView(APIView):
     """
     Historial reciente de tomas de medicamentos.
+    El paciente se identifica mediante el token JWT.
     """
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         summary="Obtener historial de medicación del paciente",
-        description="Retorna los últimos 20 registros de medicación con fecha, periodo del día (Mañana, Tarde, Noche) y estado de completación.",
-        parameters=[
-            OpenApiParameter(name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH, description="ID del paciente", required=True),
-        ],
+        description="Retorna los últimos 20 registros de medicación con fecha, periodo del día (Mañana, Tarde, Noche) y estado de completación. El paciente se identifica automáticamente mediante el token JWT.",
         responses={
             200: inline_serializer(
                 name='HistorialMedicacionResponse',
@@ -1185,21 +1183,13 @@ class HistorialMedicacionView(APIView):
                     'scheduledTime': serializers.CharField()
                 }
             ),
-            403: OpenApiResponse(description="No tiene permisos para ver este paciente"),
             404: OpenApiResponse(description="Paciente no encontrado"),
             500: OpenApiResponse(description="Error interno del servidor"),
         }
     )
-    def get(self, request, id):
+    def get(self, request):
         try:
-            paciente = Paciente.objects.select_related('user').get(id=id)
-
-            # Seguridad: IDOR check
-            if not request.user.is_staff and paciente.user != request.user:
-                return Response({
-                    "message": "No tiene permisos para acceder a los datos de este paciente",
-                    "status": 403
-                }, status=status.HTTP_403_FORBIDDEN)
+            paciente = Paciente.objects.select_related('user').get(user=request.user)
 
             queryset = RegistroMedication.objects.filter(
                 paciente=paciente
@@ -1214,8 +1204,12 @@ class HistorialMedicacionView(APIView):
                 hora = registro.hora
                 completed = str(registro.estado) == '2'
 
+                dt = datetime.combine(registro.fecha_toma, hora)
+                dt_aware = timezone.make_aware(dt)
+                completed_at = dt_aware.isoformat()
+
                 if 0 <= hora.hour < 12:
-                    period = "Mañana"
+                    period = "Manana"
                 elif 12 <= hora.hour < 18:
                     period = "Tarde"
                 else:
@@ -1223,7 +1217,7 @@ class HistorialMedicacionView(APIView):
 
                 data.append({
                     "medicationName": tm.medicamento.nombre_medicamento,
-                    "completedAt": f"{registro.fecha_toma}T{hora.strftime('%H:%M:%S')}",
+                    "completedAt": completed_at,
                     "period": period,
                     "completed": completed,
                     "scheduledTime": tm.horario,
@@ -1790,6 +1784,8 @@ class TodayMedicationsView(APIView):
                                 'dose': serializers.CharField(help_text="Dosis asignada"),
                                 'time': serializers.CharField(help_text="Hora programada (formato 12h)"),
                                 'completed': serializers.BooleanField(help_text="Si el medicamento fue tomado"),
+                                'frequency': serializers.CharField(help_text="Frecuencia de la dosis"),
+                                'instructions': serializers.CharField(help_text="Instrucciones del medicamento"),
                                 'doctorName': serializers.CharField(help_text="Nombre del doctor"),
                                 'treatmentName': serializers.CharField(help_text="Nombre del tratamiento"),
                                 'treatmentMedicationId': serializers.IntegerField(help_text="ID del TratamientoMedicamento"),
@@ -1813,7 +1809,7 @@ class TodayMedicationsView(APIView):
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
 
-            hoy = timezone.now().date()
+            hoy = timezone.localtime(timezone.now()).date()
 
             active_pts = PacienteTratamiento.objects.filter(
                 paciente=paciente,
@@ -1839,7 +1835,7 @@ class TodayMedicationsView(APIView):
             }
 
             grupos = {
-                "Mañana": [],
+                "Manana": [],
                 "Tarde": [],
                 "Noche": []
             }
@@ -1859,8 +1855,8 @@ class TodayMedicationsView(APIView):
 
                 if record:
                     item_id = str(record.id)
-                    hora_str = record.hora.strftime("%I:%M %p")
-                    hora_periodo = record.hora.hour
+                    hora_str = tm.horario
+                    hora_periodo = self._parse_horario_hour(tm.horario)
                     completed = str(record.estado) == '2'
                 else:
                     item_id = f"sched_{tm.id}"
@@ -1874,20 +1870,22 @@ class TodayMedicationsView(APIView):
                     "dose": tm.dosis,
                     "time": hora_str,
                     "completed": completed,
+                    "frequency": tm.frecuencia,
+                    "instructions": tm.instrucciones,
                     "doctorName": doctor_name,
                     "treatmentName": tratamiento.titulo,
                     "treatmentMedicationId": tm.id,
                 }
 
                 if 0 <= hora_periodo < 12:
-                    grupos["Mañana"].append(item)
+                    grupos["Manana"].append(item)
                 elif 12 <= hora_periodo < 18:
                     grupos["Tarde"].append(item)
                 else:
                     grupos["Noche"].append(item)
 
             resultado = []
-            for titulo in ["Mañana", "Tarde", "Noche"]:
+            for titulo in ["Manana", "Tarde", "Noche"]:
                 datos = grupos[titulo]
                 if len(datos) > 0:
                     completados = sum(1 for d in datos if d["completed"])
@@ -1917,9 +1915,15 @@ class TodayMedicationsView(APIView):
 
     def _parse_horario_hour(self, horario):
         import re
-        match = re.search(r'(\d{1,2}):(\d{2})', horario)
+        match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?', horario, re.IGNORECASE)
         if match:
-            return int(match.group(1))
+            hour = int(match.group(1))
+            periodo = (match.group(3) or '').upper()
+            if periodo == 'PM' and hour != 12:
+                hour += 12
+            elif periodo == 'AM' and hour == 12:
+                hour = 0
+            return hour
         return 8
 
 @extend_schema(tags=['Métricas de Hoy'])
@@ -1974,7 +1978,7 @@ class TodayMetricsView(APIView):
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
 
-            ahora = timezone.now()
+            ahora = timezone.localtime(timezone.now())
             fecha_actual = ahora.date()
             hora_actual = ahora.time()
 
@@ -2102,7 +2106,7 @@ class WeeklyAdherenceView(APIView):
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
 
-            hoy = timezone.now().date()
+            hoy = timezone.localtime(timezone.now()).date()
 
             start_of_week = hoy - timedelta(days=hoy.weekday())
 
@@ -2224,7 +2228,7 @@ class GlobalProgressView(APIView):
                     "status": 403
                 }, status=status.HTTP_403_FORBIDDEN)
 
-            hoy = timezone.now().date()
+            hoy = timezone.localtime(timezone.now()).date()
 
             active_pts = PacienteTratamiento.objects.filter(
                 paciente=paciente,
@@ -2383,19 +2387,17 @@ class MedicationRecordView(APIView):
             "Registra que un paciente tomó un medicamento. Permite adjuntar una fotografía "
             "de evidencia y observaciones opcionales. Previene duplicados verificando si ya "
             "existe un registro del mismo medicamento para el día actual. "
-            "Solo el paciente autenticado puede registrar su propia medicación."
+            "El paciente se identifica automáticamente mediante el token JWT y la hora de toma la registra el servidor."
         ),
         request={
             "multipart/form-data": {
                 "type": "object",
                 "properties": {
-                    "paciente": {"type": "integer", "description": "ID del paciente", "example": 1},
                     "tratamiento_medicamento": {"type": "integer", "description": "ID de la asignación tratamiento-medicamento", "example": 1},
-                    "hora": {"type": "string", "format": "time", "description": "Hora de toma (HH:MM)", "example": "08:00"},
                     "foto": {"type": "string", "format": "binary", "description": "Fotografía de evidencia (opcional)"},
                     "observaciones": {"type": "string", "description": "Observaciones del paciente (opcional)", "example": "Tomé con el desayuno"}
                 },
-                "required": ["paciente", "tratamiento_medicamento", "hora"]
+                "required": ["tratamiento_medicamento"]
             }
         },
         responses={
@@ -2415,28 +2417,18 @@ class MedicationRecordView(APIView):
     def post(self, request):
         try:
             data = request.data
-            paciente_id = data.get('paciente')
             tm_id = data.get('tratamiento_medicamento')
-            hora = data.get('hora')
 
-            if not paciente_id or not tm_id or not hora:
+            if not tm_id:
                 return Response({
                     "success": False,
-                    "message": "Los campos paciente, tratamiento_medicamento y hora son requeridos"
+                    "message": "El campo tratamiento_medicamento es requerido"
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            paciente = Paciente.objects.select_related('user').get(id=paciente_id)
-
-            # Validación de seguridad: solo el propio paciente o un admin
-            if not request.user.is_staff and paciente.user != request.user:
-                return Response({
-                    "success": False,
-                    "message": "No tiene permisos para registrar medicación de este paciente"
-                }, status=status.HTTP_403_FORBIDDEN)
+            paciente = Paciente.objects.select_related('user').get(user=request.user)
 
             tratamiento_medicamento = TratamientoMedicamento.objects.get(id=tm_id)
 
-            # Validar que el tratamiento pertenezca al paciente y esté activo
             tiene_tratamiento = PacienteTratamiento.objects.filter(
                 paciente=paciente,
                 tratamiento=tratamiento_medicamento.tratamiento,
@@ -2449,9 +2441,10 @@ class MedicationRecordView(APIView):
                     "message": "Este medicamento no pertenece a un tratamiento activo del paciente"
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            hoy = timezone.now().date()
+            ahora = timezone.localtime(timezone.now())
+            hoy = ahora.date()
+            hora_actual = ahora.time()
 
-            # Validar duplicados: mismo paciente + mismo tratamiento_medicamento + misma fecha
             existe = RegistroMedication.objects.filter(
                 paciente=paciente,
                 tratamiento_medicamento=tratamiento_medicamento,
@@ -2468,8 +2461,8 @@ class MedicationRecordView(APIView):
                 paciente=paciente,
                 tratamiento_medicamento=tratamiento_medicamento,
                 fecha_toma=hoy,
-                estado='2',  # Tomado
-                hora=hora,
+                estado='2',
+                hora=hora_actual,
                 foto=request.FILES.get('foto'),
                 observaciones=data.get('observaciones', '')
             )
@@ -2494,4 +2487,274 @@ class MedicationRecordView(APIView):
                 "success": False,
                 "message": "Error al registrar el medicamento",
                 "error": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@extend_schema(tags=['Medicación de Hoy'])
+class TreatmentMedicationDetailView(APIView):
+    """
+    Endpoint para obtener el detalle de un TratamientoMedicamento individual.
+    El paciente se identifica mediante el token de autenticación.
+    Retorna el estado de completación del día actual.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Obtener detalle de un medicamento del tratamiento",
+        description=(
+            "Retorna los datos de un TratamientoMedicamento específico incluyendo "
+            "el estado de completación del día actual. "
+            "El paciente se identifica automáticamente mediante el token JWT."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="tmId",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="ID del TratamientoMedicamento",
+                required=True
+            ),
+        ],
+        responses={
+            200: inline_serializer(
+                name='TreatmentMedicationDetailResponse',
+                fields={
+                    'id': serializers.CharField(),
+                    'title': serializers.CharField(help_text="Nombre del medicamento"),
+                    'dose': serializers.CharField(help_text="Dosis asignada"),
+                    'time': serializers.CharField(help_text="Hora programada"),
+                    'completed': serializers.BooleanField(help_text="Si fue tomado hoy"),
+                    'frequency': serializers.CharField(help_text="Frecuencia de la dosis"),
+                    'instructions': serializers.CharField(help_text="Instrucciones del medicamento"),
+                    'doctorName': serializers.CharField(help_text="Nombre del doctor"),
+                    'treatmentName': serializers.CharField(help_text="Nombre del tratamiento"),
+                    'treatmentMedicationId': serializers.IntegerField(help_text="ID del TratamientoMedicamento"),
+                }
+            ),
+            403: OpenApiResponse(description="El medicamento no pertenece a un tratamiento activo del paciente"),
+            404: OpenApiResponse(description="Paciente o TratamientoMedicamento no encontrado"),
+            500: OpenApiResponse(description="Error interno del servidor"),
+        }
+    )
+    def get(self, request, tmId):
+        try:
+            paciente = Paciente.objects.select_related('user').get(user=request.user)
+
+            tm = TratamientoMedicamento.objects.select_related(
+                'medicamento', 'tratamiento__doctor__user'
+            ).get(id=tmId)
+
+            tiene_tratamiento = PacienteTratamiento.objects.filter(
+                paciente=paciente,
+                tratamiento=tm.tratamiento,
+                is_active=True
+            ).exists()
+
+            if not tiene_tratamiento:
+                return Response({
+                    "message": "Este medicamento no pertenece a un tratamiento activo del paciente",
+                    "status": 403
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            hoy = timezone.localtime(timezone.now()).date()
+            record = RegistroMedication.objects.filter(
+                paciente=paciente,
+                tratamiento_medicamento=tm,
+                fecha_toma=hoy
+            ).first()
+
+            if record:
+                item_id = str(record.id)
+                hora_str = tm.horario
+                completed = str(record.estado) == '2'
+            else:
+                item_id = f"sched_{tm.id}"
+                hora_str = tm.horario
+                completed = False
+
+            return Response({
+                "id": item_id,
+                "title": tm.medicamento.nombre_medicamento,
+                "dose": tm.dosis,
+                "time": hora_str,
+                "completed": completed,
+                "frequency": tm.frecuencia,
+                "instructions": tm.instrucciones,
+                "doctorName": tm.tratamiento.doctor.user.email.split('@')[0].capitalize() if tm.tratamiento.doctor.user.email else "Doctor",
+                "treatmentName": tm.tratamiento.titulo,
+                "treatmentMedicationId": tm.id,
+            }, status=status.HTTP_200_OK)
+
+        except Paciente.DoesNotExist:
+            return Response({
+                "message": "Paciente no encontrado",
+                "status": 404
+            }, status=status.HTTP_404_NOT_FOUND)
+        except TratamientoMedicamento.DoesNotExist:
+            return Response({
+                "message": "TratamientoMedicamento no encontrado",
+                "status": 404
+            }, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({
+                "message": "Error al obtener el detalle del medicamento",
+                "error": str(e),
+                "status": 500
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@extend_schema(tags=['Tratamientos del Paciente'])
+class PatientTreatmentsView(APIView):
+    """
+    Endpoint para obtener todos los tratamientos del paciente
+    con sus medicamentos, ordenados: activos primero, completados después.
+    Sub-ordenados por la asignación más reciente.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Obtener todos los tratamientos del paciente",
+        description=(
+            "Retorna todos los tratamientos asignados al paciente autenticado, cada uno con sus medicamentos. "
+            "Ordenados: activos primero y completados después, sub-ordenados por fecha de asignación más reciente. "
+            "El estado se calcula según la fecha de fin (fecha_inicio + máx duracion_dias de sus medicamentos). "
+            "El paciente se identifica automáticamente mediante el token JWT."
+        ),
+        responses={
+            200: inline_serializer(
+                name='PatientTreatmentsResponse',
+                many=True,
+                fields={
+                    'id': serializers.CharField(help_text="UUID del tratamiento"),
+                    'title': serializers.CharField(help_text="Título del tratamiento"),
+                    'doctor': serializers.CharField(help_text="Nombre del doctor"),
+                    'startDate': serializers.CharField(help_text="Fecha de inicio del tratamiento"),
+                    'endDate': serializers.CharField(help_text="Fecha de fin calculada del tratamiento"),
+                    'status': serializers.CharField(help_text="active o completed"),
+                    'description': serializers.CharField(help_text="Descripción del tratamiento"),
+                    'medications': serializers.ListField(
+                        child=inline_serializer(
+                            name='PatientTreatmentMedicationItem',
+                            fields={
+                                'id': serializers.CharField(),
+                                'title': serializers.CharField(help_text="Nombre del medicamento"),
+                                'dose': serializers.CharField(help_text="Dosis asignada"),
+                                'time': serializers.CharField(help_text="Hora programada"),
+                                'completed': serializers.BooleanField(help_text="Si fue tomado hoy"),
+                                'frequency': serializers.CharField(help_text="Frecuencia de la dosis"),
+                                'instructions': serializers.CharField(help_text="Instrucciones del medicamento"),
+                                'doctorName': serializers.CharField(help_text="Nombre del doctor"),
+                                'treatmentName': serializers.CharField(help_text="Nombre del tratamiento"),
+                                'treatmentMedicationId': serializers.IntegerField(help_text="ID del TratamientoMedicamento"),
+                            }
+                        )
+                    ),
+                }
+            ),
+            403: OpenApiResponse(description="Usuario sin perfil de paciente"),
+            404: OpenApiResponse(description="Paciente no encontrado"),
+            500: OpenApiResponse(description="Error interno del servidor"),
+        }
+    )
+    def get(self, request):
+        try:
+            paciente = Paciente.objects.select_related('user').get(user=request.user)
+
+            hoy = timezone.localtime(timezone.now()).date()
+
+            pts = PacienteTratamiento.objects.filter(
+                paciente=paciente,
+                is_active=True
+            ).select_related('tratamiento__doctor__user').order_by('-created_at')
+
+            if not pts:
+                return Response([], status=status.HTTP_200_OK)
+
+            tratamiento_ids = [pt.tratamiento_id for pt in pts]
+            start_dates = {pt.tratamiento_id: pt.fecha_inicio if pt.fecha_inicio else pt.created_at.date()
+                          for pt in pts}
+
+            tms = TratamientoMedicamento.objects.filter(
+                tratamiento__in=tratamiento_ids,
+                is_active=True
+            ).select_related('medicamento', 'tratamiento__doctor__user')
+
+            tms_by_tratamiento = {}
+            duracion_max = {}
+            for tm in tms:
+                tms_by_tratamiento.setdefault(tm.tratamiento_id, []).append(tm)
+                current_max = duracion_max.get(tm.tratamiento_id, 0)
+                dur = tm.duracion_dias or 0
+                if dur > current_max:
+                    duracion_max[tm.tratamiento_id] = dur
+
+            hoy_records = RegistroMedication.objects.filter(
+                paciente=paciente,
+                fecha_toma=hoy,
+                tratamiento_medicamento__in=tms
+            )
+            record_by_tm = {r.tratamiento_medicamento_id: r for r in hoy_records}
+
+            result = []
+            for pt in pts:
+                tid = pt.tratamiento_id
+                tratamiento = pt.tratamiento
+                doctor = tratamiento.doctor
+                doctor_name = doctor.user.email.split('@')[0].capitalize() if doctor.user.email else "Doctor"
+
+                start_dt = start_dates.get(tid, hoy)
+                max_dur = duracion_max.get(tid, 0)
+                end_dt = start_dt + timedelta(days=max_dur) if max_dur else start_dt
+                treatment_status = 'active' if end_dt > hoy else 'completed'
+
+                medications = []
+                for tm in tms_by_tratamiento.get(tid, []):
+                    record = record_by_tm.get(tm.id)
+                    if record:
+                        item_id = str(record.id)
+                        hora_str = tm.horario
+                        completed = str(record.estado) == '2'
+                    else:
+                        item_id = f"sched_{tm.id}"
+                        hora_str = tm.horario
+                        completed = False
+
+                    medications.append({
+                        "id": item_id,
+                        "title": tm.medicamento.nombre_medicamento,
+                        "dose": tm.dosis,
+                        "time": hora_str,
+                        "completed": completed,
+                        "frequency": tm.frecuencia,
+                        "instructions": tm.instrucciones,
+                        "doctorName": doctor_name,
+                        "treatmentName": tratamiento.titulo,
+                        "treatmentMedicationId": tm.id,
+                    })
+
+                result.append({
+                    "id": str(tratamiento.uuid),
+                    "title": tratamiento.titulo,
+                    "doctor": doctor_name,
+                    "startDate": start_dt.isoformat(),
+                    "endDate": end_dt.isoformat(),
+                    "status": treatment_status,
+                    "description": tratamiento.descripcion,
+                    "medications": medications,
+                })
+
+            result.sort(key=lambda t: (0 if t['status'] == 'active' else 1, 0))
+
+            return Response(result, status=status.HTTP_200_OK)
+
+        except Paciente.DoesNotExist:
+            return Response({
+                "message": "Paciente no encontrado",
+                "status": 404
+            }, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({
+                "message": "Error al obtener los tratamientos del paciente",
+                "error": str(e),
+                "status": 500
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
