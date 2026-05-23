@@ -76,3 +76,12 @@ class RegistroMedication(models.Model):
 
     def __str__(self): 
         return f"{self.paciente.user.email} - {self.tratamiento_medicamento.medicamento.nombre_medicamento}" 
+
+class ChatMessage(models.Model):
+    paciente = models.ForeignKey(Paciente, on_delete=models.CASCADE, related_name='chat_messages')
+    role = models.CharField(max_length=10, choices=[('user', 'Usuario'), ('assistant', 'Asistente')])
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']

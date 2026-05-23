@@ -1,11 +1,14 @@
 
+from django.shortcuts import get_object_or_404
+from clinix.models import ChatMessage
 from rest_framework.decorators import permission_classes
 from rest_framework import generics, status
 from rest_framework.response import Response
 from django.db import transaction; 
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
-
+from openai import OpenAI
+from django.conf import settings
 from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
 from .serializers import TratamientoSerializer, MedicamentoSerializer, PacienteTratamientoSerializer, TratamientoMedicamentoSerializer
@@ -15,9 +18,8 @@ from datetime import timedelta, datetime
 from django.db.models import Q, Count
 from drf_spectacular.utils import inline_serializer
 from rest_framework import serializers
-#Integracion de los endpoints para el manejo de las citas 
+import re
 
-# Endpoint para los medicamentos 
 
 @extend_schema(tags=['Medicamentos'])
 class MedicamentoView(APIView): 
@@ -44,7 +46,7 @@ class MedicamentoView(APIView):
     )
     def get(self, request, id=None): 
         try:
-            # Obtenemos el doctor logueado
+        
             doctor = request.user.doctor
         except Exception:
             return Response({
@@ -2758,3 +2760,395 @@ class PatientTreatmentsView(APIView):
                 "error": str(e),
                 "status": 500
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@extend_schema(tags=['IA'])
+class PatientChatView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Obtener historial del chat",
+        description="Devuelve los últimos mensajes del chat del paciente autenticado. Si no hay mensajes previos, genera automáticamente el primer mensaje contextual con el resumen del estado actual del paciente y sus medicamentos.",
+        responses={
+            200: inline_serializer(
+                name='ChatHistoryResponse',
+                many=True,
+                fields={
+                    'id': serializers.IntegerField(),
+                    'role': serializers.CharField(help_text="user o assistant"),
+                    'content': serializers.CharField(),
+                    'created_at': serializers.DateTimeField(),
+                    'medicamentos_relacionados': serializers.ListField(
+                        child=inline_serializer(
+                            name='MedicamentoChatInfo',
+                            fields={
+                                'id': serializers.IntegerField(),
+                                'nombre': serializers.CharField(),
+                                'dosis': serializers.CharField(),
+                                'horario': serializers.CharField(),
+                            }
+                        ),
+                        required=False
+                    ),
+                }
+            ),
+            403: OpenApiResponse(description="Usuario sin perfil de paciente"),
+            500: OpenApiResponse(description="Error interno"),
+        }
+    )
+    def get(self, request):
+        paciente = get_object_or_404(Paciente, user=request.user)
+        messages = ChatMessage.objects.filter(paciente=paciente).order_by('created_at')[:50]
+
+        if not messages.exists():
+            initial_text = self._build_initial_message(paciente)
+            assistant_msg = ChatMessage.objects.create(
+                paciente=paciente,
+                role='assistant',
+                content=initial_text
+            )
+            messages = [assistant_msg]
+
+        medicamentos_activos = self._get_medicamentos_activos(paciente)
+
+        data = []
+        for m in messages:
+            msg_data = {
+                'id': m.id,
+                'role': m.role,
+                'content': m.content,
+                'created_at': m.created_at.isoformat()
+            }
+
+            if m.role == 'assistant' and medicamentos_activos:
+                relacionados = self._find_medicamentos_in_text(m.content, medicamentos_activos)
+                if relacionados:
+                    msg_data['medicamentos_relacionados'] = relacionados
+            data.append(msg_data)
+
+        return Response(data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Enviar mensaje al chat clínico",
+        description="El paciente envía un mensaje sobre su estado de salud y el sistema responde con un análisis contextual. Solo se responderán temas de salud, tratamientos y seguimiento médico.",
+        request=inline_serializer(
+            name='ChatMessageRequest',
+            fields={'message': serializers.CharField(help_text="Texto del paciente sobre su estado de salud")}
+        ),
+        responses={
+            201: inline_serializer(
+                name='ChatMessageResponse',
+                fields={
+                    'id': serializers.IntegerField(),
+                    'role': serializers.CharField(),
+                    'content': serializers.CharField(),
+                    'created_at': serializers.DateTimeField(),
+                    'medicamentos_relacionados': serializers.ListField(
+                        child=inline_serializer(
+                            name='MedicamentoChatInfo',
+                            fields={
+                                'id': serializers.IntegerField(),
+                                'nombre': serializers.CharField(),
+                                'dosis': serializers.CharField(),
+                                'horario': serializers.CharField(),
+                            }
+                        ),
+                        required=False
+                    ),
+                }
+            ),
+            400: OpenApiResponse(description="Mensaje vacío o fuera de contexto"),
+            403: OpenApiResponse(description="Usuario sin perfil de paciente"),
+            500: OpenApiResponse(description="Error al comunicarse con la IA"),
+        }
+    )
+    def post(self, request):
+        paciente = get_object_or_404(Paciente, user=request.user)
+        user_message = request.data.get('message', '').strip()
+        if not user_message:
+            return Response(
+                {"error": "El mensaje no puede estar vacío"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        ChatMessage.objects.create(
+            paciente=paciente,
+            role='user',
+            content=user_message
+        )
+
+        palabras_prohibidas = [
+            'código', 'programa', 'java', 'python', 'javascript', 'hola mundo',
+            'receta', 'cocina', 'chiste', 'poema', 'canción', 'traduce',
+            'escribe un', 'crea un', 'genera un', 'dame un ejemplo de código'
+        ]
+        mensaje_lower = user_message.lower()
+        for palabra in palabras_prohibidas:
+            if palabra in mensaje_lower:
+                respuesta_bloqueo = "Como tu asistente de salud, solo puedo ayudarte con temas relacionados a tu tratamiento y bienestar. ¿Cómo te has sentido hoy respecto a tu tratamiento?"
+                assistant_msg = ChatMessage.objects.create(
+                    paciente=paciente,
+                    role='assistant',
+                    content=respuesta_bloqueo
+                )
+                return Response({
+                    'id': assistant_msg.id,
+                    'role': 'assistant',
+                    'content': assistant_msg.content,
+                    'created_at': assistant_msg.created_at.isoformat(),
+                    'medicamentos_relacionados': []
+                }, status=status.HTTP_201_CREATED)
+
+        try:
+            system_prompt = self._build_system_prompt(paciente)
+            history = ChatMessage.objects.filter(paciente=paciente).order_by('created_at')[:20]
+
+            messages = [{"role": "system", "content": system_prompt}]
+            for msg in history:
+                messages.append({"role": msg.role, "content": msg.content})
+
+            client = OpenAI(
+                api_key=settings.DEEPSEEK_API_KEY,
+                base_url="https://api.deepseek.com"
+            )
+            response_ai = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500
+            )
+            assistant_reply = response_ai.choices[0].message.content
+
+            assistant_msg = ChatMessage.objects.create(
+                paciente=paciente,
+                role='assistant',
+                content=assistant_reply
+            )
+
+
+            medicamentos_activos = self._get_medicamentos_activos(paciente)
+            medicamentos_relacionados = self._find_medicamentos_in_text(
+                assistant_reply, medicamentos_activos
+            )
+
+            return Response({
+                'id': assistant_msg.id,
+                'role': 'assistant',
+                'content': assistant_msg.content,
+                'created_at': assistant_msg.created_at.isoformat(),
+                'medicamentos_relacionados': medicamentos_relacionados
+            }, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            return Response(
+                {"error": f"Error al comunicarse con DeepSeek: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    def _get_medicamentos_activos(self, paciente):
+        """Obtiene todos los medicamentos activos de todos los tratamientos del paciente."""
+        hoy = timezone.localtime(timezone.now()).date()
+        tratamientos_activos = PacienteTratamiento.objects.filter(
+            paciente=paciente,
+            is_active=True
+        ).select_related('tratamiento')
+
+        data = []
+        for pt in tratamientos_activos:
+            fecha_inicio = pt.fecha_inicio or pt.created_at.date()
+            meds = TratamientoMedicamento.objects.filter(
+                tratamiento=pt.tratamiento,
+                is_active=True
+            ).select_related('medicamento')
+
+            for tm in meds:
+    
+                vigente = True
+                if tm.duracion_dias is not None and tm.duracion_dias > 0:
+                    fecha_fin = fecha_inicio + timedelta(days=tm.duracion_dias)
+                    if fecha_fin < hoy:
+                        vigente = False
+                if vigente:
+                    data.append({
+                        'id': tm.id,
+                        'nombre': tm.medicamento.nombre_medicamento,
+                        'dosis': tm.dosis,
+                        'horario': tm.horario,
+                        'tratamiento': pt.tratamiento.titulo
+                    })
+        return data
+
+    def _find_medicamentos_in_text(self, text, medicamentos_activos):
+        """Busca qué medicamentos de la lista aparecen mencionados en el texto (ignora Markdown)."""
+        texto_limpio = re.sub(r'(\*{1,2}|_{1,2}|`{1,3}|#+\s?)', '', text).lower()
+        relacionados = []
+        for med in medicamentos_activos:
+            if med['nombre'].lower() in texto_limpio:
+                relacionados.append({
+                    'id': med['id'],
+                    'nombre': med['nombre'],
+                    'dosis': med['dosis'],
+                    'horario': med['horario']
+                })
+        return relacionados
+
+    def _build_system_prompt(self, paciente):
+        hoy = timezone.localtime(timezone.now()).date()
+        tratamientos = PacienteTratamiento.objects.filter(
+            paciente=paciente, is_active=True
+        ).select_related('tratamiento', 'tratamiento__doctor__user')
+
+        if not tratamientos.exists():
+            return (
+                "Eres un asistente clínico ESPECIALIZADO. "
+                "El paciente no tiene tratamientos activos. "
+                "Solo puedes hablar sobre salud, síntomas y bienestar general. "
+                "No menciones medicamentos porque no hay datos."
+            )
+
+        nombre = paciente.user.email.split('@')[0].capitalize() if paciente.user.email else "Paciente"
+        tratamientos_info = []
+        medicamentos_info = []
+
+        for pt in tratamientos:
+            t = pt.tratamiento
+            doctor_nombre = t.doctor.user.email.split('@')[0].capitalize() if t.doctor.user.email else "Doctor"
+            fecha_inicio = pt.fecha_inicio or pt.created_at.date()
+            dias_transcurridos = (hoy - fecha_inicio).days + 1
+
+            tratamientos_info.append(
+                f"- {t.titulo} (Día {dias_transcurridos}, Dr. {doctor_nombre}, inicio: {fecha_inicio})"
+            )
+
+            meds = TratamientoMedicamento.objects.filter(
+                tratamiento=t, is_active=True
+            ).select_related('medicamento')
+
+            for tm in meds:
+            
+                vigente = True
+                if tm.duracion_dias is not None and tm.duracion_dias > 0:
+                    fecha_fin = fecha_inicio + timedelta(days=tm.duracion_dias)
+                    if fecha_fin < hoy:
+                        vigente = False
+                if vigente:
+                    medicamentos_info.append(
+                        f"  • {tm.medicamento.nombre_medicamento} - {tm.dosis} - {tm.horario} "
+                        f"(Frecuencia: {tm.frecuencia}, Instrucciones: {tm.instrucciones}, "
+                        f"Tratamiento: {t.titulo})"
+                    )
+
+        ultimo_mensaje = ChatMessage.objects.filter(
+            paciente=paciente, role='assistant'
+        ).order_by('-created_at').first()
+        ultimo_contexto = ultimo_mensaje.content[:200] if ultimo_mensaje else "Sin conversaciones previas."
+
+        regs = RegistroMedication.objects.filter(
+            paciente=paciente,
+            tratamiento_medicamento__tratamiento__in=[pt.tratamiento_id for pt in tratamientos]
+        ).aggregate(total=Count('id'), tomados=Count('id', filter=Q(estado='2')))
+        total = regs['total'] or 0
+        tomados = regs['tomados'] or 0
+        adherencia = int((tomados / total) * 100) if total > 0 else 0
+
+        registros_hoy = RegistroMedication.objects.filter(
+            paciente=paciente, fecha_toma=hoy
+        ).select_related('tratamiento_medicamento__medicamento').order_by('-hora')[:5]
+        tomas_hoy = []
+        for r in registros_hoy:
+            estado = "✅ Tomado" if str(r.estado) == '2' else "⏳ Pendiente"
+            tomas_hoy.append(
+                f"  • {r.tratamiento_medicamento.medicamento.nombre_medicamento} - {r.hora.strftime('%H:%M')} - {estado}"
+            )
+
+        prompt = f"""Eres un asistente clínico ESPECIALIZADO en seguimiento de pacientes.
+
+        🔒 RESTRICCIONES ABSOLUTAS:
+        1. SOLO respondes sobre salud, síntomas, tratamientos, medicamentos y bienestar.
+        2. NUNCA respondas sobre programación, recetas, chistes u otros temas no médicos.
+        3. Si el paciente pregunta algo fuera de contexto clínico, responde ÚNICAMENTE: "Como tu asistente de salud, solo puedo ayudarte con temas relacionados a tu tratamiento. ¿Cómo te has sentido hoy?"
+        4. NUNCA uses Markdown, solo texto plano con emojis sutiles.
+        5. NUNCA digas que eres una IA o asistente virtual.
+
+        📋 DATOS DEL PACIENTE:
+        • Nombre: {nombre}
+        • Fecha actual: {hoy}
+
+        💊 TRATAMIENTOS ACTIVOS:
+        {chr(10).join(tratamientos_info) if tratamientos_info else "No hay tratamientos activos"}
+
+        💉 MEDICAMENTOS PRESCRITOS (ESTOS SON LOS DATOS REALES, NO LOS INVENTES):
+        {chr(10).join(medicamentos_info) if medicamentos_info else "⚠️ NO HAY MEDICAMENTOS REGISTRADOS"}
+
+        📊 ADHERENCIA: {adherencia}% ({tomados} de {total} tomas registradas)
+
+        📝 TOMAS DE HOY:
+        {chr(10).join(tomas_hoy) if tomas_hoy else "Aún no hay registros hoy"}
+
+        🚨 INSTRUCCIÓN CRÍTICA SOBRE MEDICAMENTOS:
+        - SIEMPRE menciona los medicamentos EXACTAMENTE como aparecen en la lista de arriba.
+        - SI la lista dice "NO HAY MEDICAMENTOS REGISTRADOS", NUNCA preguntes por medicamentos ni digas que "no los tienes registrados". Simplemente no hables de medicamentos.
+        - NUNCA preguntes "¿qué medicamentos te recetaron?" porque YA tienes esa información en el sistema.
+        - NUNCA digas frases como "no tengo registrados los nombres" o "no cuento con los nombres en mi sistema".
+
+        🎯 DIRECTRICES:
+        1. Saluda con el nombre del paciente.
+        2. Pregunta sobre síntomas y bienestar.
+        3. Menciona los medicamentos POR SU NOMBRE si aparecen en la lista.
+        4. Respuestas breves (máximo 4 líneas).
+        5. Termina con una pregunta abierta.
+        """
+        return prompt
+
+    def _build_initial_message(self, paciente):
+        hoy = timezone.localtime(timezone.now()).date()
+        tratamientos = PacienteTratamiento.objects.filter(
+            paciente=paciente, is_active=True
+        ).select_related('tratamiento')
+
+        nombre = paciente.user.email.split('@')[0].capitalize() if paciente.user.email else "Paciente"
+        if not tratamientos.exists():
+            return (
+                f"Hola {nombre} 👋\n\n"
+                f"Actualmente no tienes ningún tratamiento activo. "
+                f"Si tu médico te ha asignado uno, aparecerá aquí y podremos dar seguimiento.\n\n"
+                f"¿Hay algo sobre tu salud que quieras comentarme?"
+            )
+
+    
+        pt = tratamientos.first()
+        tratamiento = pt.tratamiento
+        fecha_inicio = pt.fecha_inicio or pt.created_at.date()
+        dias_transcurridos = (hoy - fecha_inicio).days + 1
+
+    
+        medicamentos_hoy = []
+        for pt_item in tratamientos:
+            fecha_inicio_item = pt_item.fecha_inicio or pt_item.created_at.date()
+            meds = TratamientoMedicamento.objects.filter(
+                tratamiento=pt_item.tratamiento, is_active=True
+            ).select_related('medicamento')
+            for tm in meds:
+                vigente = True
+                if tm.duracion_dias is not None and tm.duracion_dias > 0:
+                    fecha_fin = fecha_inicio_item + timedelta(days=tm.duracion_dias)
+                    if fecha_fin < hoy:
+                        vigente = False
+                if vigente:
+                    medicamentos_hoy.append(
+                        f"  💊 {tm.medicamento.nombre_medicamento} - {tm.dosis} a las {tm.horario} ({pt_item.tratamiento.titulo})"
+                    )
+
+        registros_hoy = RegistroMedication.objects.filter(
+            paciente=paciente,
+            fecha_toma=hoy
+        ).count()
+
+        mensaje = (
+            f"Hola {nombre} 👋\n\n"
+            f"Estás en el día {dias_transcurridos} de tu tratamiento \"{tratamiento.titulo}\".\n\n"
+            f"📋 Tus medicamentos de hoy:\n"
+            f"{chr(10).join(medicamentos_hoy) if medicamentos_hoy else '  No hay medicamentos programados para hoy'}\n\n"
+            f"✅ Tomas registradas hoy: {registros_hoy}\n\n"
+            f"¿Cómo te has sentido hoy? Cuéntame sobre cualquier síntoma o cambio que hayas notado."
+        )
+        return mensaje

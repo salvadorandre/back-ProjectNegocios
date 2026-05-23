@@ -1,4 +1,5 @@
 
+from clinix.api import PatientChatView
 from django.urls import path, include
 from .api import MedicamentoView, TratamientoView, PacienteTratamientoView, TratamientoMedicamentoView, DashboardPacienteView, TratamientosActivosPacienteView, TratamientosPacienteView, HistorialMedicacionView, EstadisticaAdherenciaView, DashboardDoctorView, PacientesDoctorView, ReportePacienteDoctorView, TratamientosDoctorView, RendimientoPorTratamientoView, TodayMedicationsView, TodayMetricsView, WeeklyAdherenceView, GlobalProgressView, TreatmentDetailView, MedicationRecordView, TreatmentMedicationDetailView, PatientTreatmentsView
 urlpatterns = [
@@ -33,5 +34,5 @@ urlpatterns = [
     path('medication-records/', MedicationRecordView.as_view(), name='medication_records'),
     path('treatment-medications/<int:tmId>/detail/', TreatmentMedicationDetailView.as_view(), name='treatment_medication_detail'),
     path('patient-treatments/', PatientTreatmentsView.as_view(), name='patient_treatments'),
-
+    path('chat/', PatientChatView.as_view(), name='patient-chat'),
 ]
