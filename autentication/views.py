@@ -380,14 +380,43 @@ class TokenRefreshView(APIView):
 
         try:
             token = RefreshToken(refresh_token)
-            user = token.user
+            user_id = token['user_id']
+            user = Usuario.objects.get(id=user_id)
             access = str(token.access_token)
             token.blacklist()
+            new_refresh = RefreshToken.for_user(user)
             serializer = UsuarioSerializer(user)
+
+            doctor = Doctor.objects.filter(user=user).first()
+            if doctor:
+                return Response({
+                    'message': 'Token refrescado exitosamente',
+                    'user': serializer.data,
+                    'doctor_id': {
+                        'id': doctor.id,
+                        'especialidad': doctor.especialidad,
+                        'colegiado': doctor.colegiado,
+                    },
+                    'refresh': str(new_refresh),
+                    'access': access,
+                }, status=status.HTTP_200_OK)
+
+            paciente = Paciente.objects.filter(user=user).first()
+            if paciente:
+                return Response({
+                    'message': 'Token refrescado exitosamente',
+                    'user': serializer.data,
+                    'paciente_id': {
+                        'id': paciente.id,
+                    },
+                    'refresh': str(new_refresh),
+                    'access': access,
+                }, status=status.HTTP_200_OK)
+
             return Response({
                 'message': 'Token refrescado exitosamente',
                 'user': serializer.data,
-                'refresh': str(token),
+                'refresh': str(new_refresh),
                 'access': access,
             }, status=status.HTTP_200_OK)
 
